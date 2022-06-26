@@ -1,126 +1,77 @@
 package e2e
 
 import (
-	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
-	"github.com/ory/dockertest/v3/docker"
+	govtypes "github.com/cosmos/cosmos-sdk/x/gov/types"
+	stakingtypes "github.com/cosmos/cosmos-sdk/x/staking/types"
+
+	superfluidtypes "github.com/osmosis-labs/osmosis/v7/x/superfluid/types"
 
 	"github.com/osmosis-labs/osmosis/v7/tests/e2e/chain"
 	"github.com/osmosis-labs/osmosis/v7/tests/e2e/util"
 )
 
-func (s *IntegrationTestSuite) connectIBCChains(chainA *chain.Chain, chainB *chain.Chain) {
-	s.T().Logf("connecting %s and %s chains via IBC", chainA.ChainMeta.Id, chainB.ChainMeta.Id)
+func (s *IntegrationTestSuite) ExecQueryRPC(path string) ([]byte, error) {
+	var err error
+	var resp *http.Response
+	retriesLeft := 5
+	for {
+		resp, err = http.Get(path)
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
+		if resp.StatusCode == http.StatusServiceUnavailable {
+			retriesLeft--
+			if retriesLeft == 0 {
+				return nil, err
+			}
+			time.Sleep(10 * time.Second)
+		} else {
+			break
+		}
+	}
 
-	exec, err := s.dkrPool.Client.CreateExec(docker.CreateExecOptions{
-		Context:      ctx,
-		AttachStdout: true,
-		AttachStderr: true,
-		Container:    s.hermesResource.Container.ID,
-		User:         "root",
-		Cmd: []string{
-			"hermes",
-			"create",
-			"channel",
-			chainA.ChainMeta.Id,
-			chainB.ChainMeta.Id,
-			"--port-a=transfer",
-			"--port-b=transfer",
-		},
-	})
-	s.Require().NoError(err)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute HTTP request: %w", err)
+	}
 
-	var (
-		outBuf bytes.Buffer
-		errBuf bytes.Buffer
-	)
+	defer resp.Body.Close()
 
-	err = s.dkrPool.Client.StartExec(exec.ID, docker.StartExecOptions{
-		Context:      ctx,
-		Detach:       false,
-		OutputStream: &outBuf,
-		ErrorStream:  &errBuf,
-	})
-	s.Require().NoErrorf(
-		err,
-		"failed connect chains; stdout: %s, stderr: %s", outBuf.String(), errBuf.String(),
-	)
-
-	s.Require().Containsf(
-		errBuf.String(),
-		"successfully opened init channel",
-		"failed to connect chains via IBC: %s", errBuf.String(),
-	)
-
-	s.T().Logf("connected %s and %s chains via IBC", chainA.ChainMeta.Id, chainB.ChainMeta.Id)
+	bz, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	return bz, nil
 }
 
-func (s *IntegrationTestSuite) sendIBC(srcChain *chain.Chain, dstChain *chain.Chain, recipient string, token sdk.Coin) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
+func (s *IntegrationTestSuite) connectIBCChains(chainA *chainConfig, chainB *chainConfig) {
+	s.T().Logf("connecting %s and %s chains via IBC", chainA.meta.Id, chainB.meta.Id)
+	cmd := []string{"hermes", "create", "channel", chainA.meta.Id, chainB.meta.Id, "--port-a=transfer", "--port-b=transfer"}
+	_, _, err := s.containerManager.ExecCmd(s.T(), "", 0, cmd, "successfully opened init channel")
+	s.Require().NoError(err)
+	s.T().Logf("connected %s and %s chains via IBC", chainA.meta.Id, chainB.meta.Id)
+}
 
-	s.T().Logf("sending %s from %s to %s (%s)", token, srcChain.ChainMeta.Id, dstChain.ChainMeta.Id, recipient)
-	balancesBPre, err := s.queryBalances(s.valResources[dstChain.ChainMeta.Id][0].Container.ID, recipient)
+func (s *IntegrationTestSuite) sendIBC(srcChain *chainConfig, dstChain *chainConfig, recipient string, token sdk.Coin) {
+	cmd := []string{"hermes", "tx", "raw", "ft-transfer", dstChain.meta.Id, srcChain.meta.Id, "transfer", "channel-0", token.Amount.String(), fmt.Sprintf("--denom=%s", token.Denom), fmt.Sprintf("--receiver=%s", recipient), "--timeout-height-offset=1000"}
+	_, _, err := s.containerManager.ExecCmd(s.T(), "", 0, cmd, "Success")
 	s.Require().NoError(err)
 
-	var (
-		outBuf bytes.Buffer
-		errBuf bytes.Buffer
-	)
+	s.T().Logf("sending %s from %s to %s (%s)", token, srcChain.meta.Id, dstChain.meta.Id, recipient)
+	balancesBPre, err := s.queryBalances(dstChain, 0, recipient)
+	s.Require().NoError(err)
 
 	s.Require().Eventually(
 		func() bool {
-			exec, err := s.dkrPool.Client.CreateExec(docker.CreateExecOptions{
-				Context:      ctx,
-				AttachStdout: true,
-				AttachStderr: true,
-				Container:    s.hermesResource.Container.ID,
-				User:         "root",
-				Cmd: []string{
-					"hermes",
-					"tx",
-					"raw",
-					"ft-transfer",
-					dstChain.ChainMeta.Id,
-					srcChain.ChainMeta.Id,
-					"transfer",  // source chain port ID
-					"channel-0", // since only one connection/channel exists, assume 0
-					token.Amount.String(),
-					fmt.Sprintf("--denom=%s", token.Denom),
-					fmt.Sprintf("--receiver=%s", recipient),
-					"--timeout-height-offset=1000",
-				},
-			})
-			s.Require().NoError(err)
-
-			err = s.dkrPool.Client.StartExec(exec.ID, docker.StartExecOptions{
-				Context:      ctx,
-				Detach:       false,
-				OutputStream: &outBuf,
-				ErrorStream:  &errBuf,
-			})
-
-			return strings.Contains(outBuf.String(), "Success")
-		},
-		time.Minute,
-		time.Second,
-		"tx returned a non-zero code; stdout: %s, stderr: %s", outBuf.String(), errBuf.String(),
-	)
-
-	s.Require().Eventually(
-		func() bool {
-			balancesBPost, err := s.queryBalances(s.valResources[dstChain.ChainMeta.Id][0].Container.ID, recipient)
+			balancesBPost, err := s.queryBalances(dstChain, 0, recipient)
 			s.Require().NoError(err)
 			ibcCoin := balancesBPost.Sub(balancesBPre)
 			if ibcCoin.Len() == 1 {
@@ -135,269 +86,226 @@ func (s *IntegrationTestSuite) sendIBC(srcChain *chain.Chain, dstChain *chain.Ch
 		},
 		5*time.Minute,
 		time.Second,
-		"tx not recieved on destination chain",
+		"tx not received on destination chain",
 	)
 
 	s.T().Log("successfully sent IBC tokens")
 }
 
-func (s *IntegrationTestSuite) submitProposal(c *chain.Chain, upgradeHeight int) {
-	upgradeHeightStr := strconv.Itoa(upgradeHeight)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-
-	s.T().Logf("submitting upgrade proposal on %s container: %s", s.valResources[c.ChainMeta.Id][0].Container.Name[1:], s.valResources[c.ChainMeta.Id][0].Container.ID)
-
-	var (
-		outBuf bytes.Buffer
-		errBuf bytes.Buffer
-	)
-
-	s.Require().Eventually(
-		func() bool {
-			exec, err := s.dkrPool.Client.CreateExec(docker.CreateExecOptions{
-				Context:      ctx,
-				AttachStdout: true,
-				AttachStderr: true,
-				Container:    s.valResources[c.ChainMeta.Id][0].Container.ID,
-				User:         "root",
-				Cmd: []string{
-					"osmosisd", "tx", "gov", "submit-proposal", "software-upgrade", upgradeVersion, fmt.Sprintf("--title=\"%s upgrade\"", upgradeVersion), "--description=\"upgrade proposal submission\"", fmt.Sprintf("--upgrade-height=%s", upgradeHeightStr), "--upgrade-info=\"\"", fmt.Sprintf("--chain-id=%s", c.ChainMeta.Id), "--from=val", "-b=block", "--yes", "--keyring-backend=test", "--log_format=json",
-				},
-			})
-			s.Require().NoError(err)
-
-			err = s.dkrPool.Client.StartExec(exec.ID, docker.StartExecOptions{
-				Context:      ctx,
-				Detach:       false,
-				OutputStream: &outBuf,
-				ErrorStream:  &errBuf,
-			})
-			return strings.Contains(outBuf.String(), "code: 0")
-		},
-		time.Minute,
-		time.Second,
-		"tx returned a non-zero code; stdout: %s, stderr: %s", outBuf.String(), errBuf.String(),
-	)
-
-	s.T().Log("successfully submitted proposal")
+func (s *IntegrationTestSuite) submitUpgradeProposal(c *chainConfig) {
+	upgradeHeightStr := strconv.Itoa(c.propHeight)
+	validatorResource, exists := s.containerManager.GetValidatorResource(c.meta.Id, 0)
+	s.Require().True(exists)
+	s.T().Logf("submitting upgrade proposal on %s container: %s", validatorResource.Container.Name[1:], validatorResource.Container.ID)
+	cmd := []string{"osmosisd", "tx", "gov", "submit-proposal", "software-upgrade", s.upgradeVersion, fmt.Sprintf("--title=\"%s upgrade\"", s.upgradeVersion), "--description=\"upgrade proposal submission\"", fmt.Sprintf("--upgrade-height=%s", upgradeHeightStr), "--upgrade-info=\"\"", fmt.Sprintf("--chain-id=%s", c.meta.Id), "--from=val", "-b=block", "--yes", "--keyring-backend=test", "--log_format=json"}
+	_, _, err := s.containerManager.ExecCmd(s.T(), c.meta.Id, 0, cmd, "code: 0")
+	s.Require().NoError(err)
+	s.T().Log("successfully submitted upgrade proposal")
+	c.latestProposalNumber = c.latestProposalNumber + 1
 }
 
-func (s *IntegrationTestSuite) depositProposal(c *chain.Chain) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
+func (s *IntegrationTestSuite) submitSuperfluidProposal(c *chainConfig, asset string) {
+	validatorResource, exists := s.containerManager.GetValidatorResource(c.meta.Id, 0)
+	s.Require().True(exists)
+	s.T().Logf("submitting superfluid proposal for asset %s on %s container: %s", asset, validatorResource.Container.Name[1:], validatorResource.Container.ID)
+	cmd := []string{"osmosisd", "tx", "gov", "submit-proposal", "set-superfluid-assets-proposal", fmt.Sprintf("--superfluid-assets=%s", asset), fmt.Sprintf("--title=\"%s superfluid asset\"", asset), fmt.Sprintf("--description=\"%s superfluid asset\"", asset), "--from=val", "-b=block", "--yes", "--keyring-backend=test", "--log_format=json", fmt.Sprintf("--chain-id=%s", c.meta.Id)}
+	_, _, err := s.containerManager.ExecCmd(s.T(), c.meta.Id, 0, cmd, "code: 0")
+	s.Require().NoError(err)
+	s.T().Log("successfully submitted superfluid proposal")
+	c.latestProposalNumber = c.latestProposalNumber + 1
+}
 
-	s.T().Logf("depositing to upgrade proposal from %s container: %s", s.valResources[c.ChainMeta.Id][0].Container.Name[1:], s.valResources[c.ChainMeta.Id][0].Container.ID)
+func (s *IntegrationTestSuite) submitTextProposal(c *chainConfig, text string) {
+	validatorResource, exists := s.containerManager.GetValidatorResource(c.meta.Id, 0)
+	s.Require().True(exists)
+	s.T().Logf("submitting text proposal on %s container: %s", validatorResource.Container.Name[1:], validatorResource.Container.ID)
+	cmd := []string{"osmosisd", "tx", "gov", "submit-proposal", "--type=text", fmt.Sprintf("--title=\"%s\"", text), "--description=\"test text proposal\"", "--from=val", "-b=block", "--yes", "--keyring-backend=test", "--log_format=json", fmt.Sprintf("--chain-id=%s", c.meta.Id)}
+	_, _, err := s.containerManager.ExecCmd(s.T(), c.meta.Id, 0, cmd, "code: 0")
+	s.Require().NoError(err)
+	s.T().Log("successfully submitted text proposal")
+	c.latestProposalNumber = c.latestProposalNumber + 1
+}
 
-	var (
-		outBuf bytes.Buffer
-		errBuf bytes.Buffer
-	)
-
-	s.Require().Eventually(
-		func() bool {
-			exec, err := s.dkrPool.Client.CreateExec(docker.CreateExecOptions{
-				Context:      ctx,
-				AttachStdout: true,
-				AttachStderr: true,
-				Container:    s.valResources[c.ChainMeta.Id][0].Container.ID,
-				User:         "root",
-				Cmd: []string{
-					"osmosisd", "tx", "gov", "deposit", "1", "10000000stake", "--from=val", fmt.Sprintf("--chain-id=%s", c.ChainMeta.Id), "-b=block", "--yes", "--keyring-backend=test",
-				},
-			})
-			s.Require().NoError(err)
-
-			err = s.dkrPool.Client.StartExec(exec.ID, docker.StartExecOptions{
-				Context:      ctx,
-				Detach:       false,
-				OutputStream: &outBuf,
-				ErrorStream:  &errBuf,
-			})
-			return strings.Contains(outBuf.String(), "code: 0")
-		},
-		time.Minute,
-		time.Second,
-		"tx returned a non-zero code; stdout: %s, stderr: %s", outBuf.String(), errBuf.String(),
-	)
-
+func (s *IntegrationTestSuite) depositProposal(c *chainConfig) {
+	propStr := strconv.Itoa(c.latestProposalNumber)
+	validatorResource, exists := s.containerManager.GetValidatorResource(c.meta.Id, 0)
+	s.Require().True(exists)
+	s.T().Logf("depositing to proposal from %s container: %s", validatorResource.Container.Name[1:], validatorResource.Container.ID)
+	cmd := []string{"osmosisd", "tx", "gov", "deposit", propStr, "500000000uosmo", "--from=val", fmt.Sprintf("--chain-id=%s", c.meta.Id), "-b=block", "--yes", "--keyring-backend=test"}
+	_, _, err := s.containerManager.ExecCmd(s.T(), c.meta.Id, 0, cmd, "code: 0")
+	s.Require().NoError(err)
 	s.T().Log("successfully deposited to proposal")
-
 }
 
-func (s *IntegrationTestSuite) voteProposal(chainConfig *chainConfig) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	chain := chainConfig.chain
-
-	s.T().Logf("voting for upgrade proposal for chain-id: %s", chain.ChainMeta.Id)
-	for i := range chain.Validators {
-		if _, ok := chainConfig.skipRunValidatorIndexes[i]; ok {
+func (s *IntegrationTestSuite) voteProposal(c *chainConfig) {
+	propStr := strconv.Itoa(c.latestProposalNumber)
+	s.T().Logf("voting yes on proposal for chain-id: %s", c.meta.Id)
+	cmd := []string{"osmosisd", "tx", "gov", "vote", propStr, "yes", "--from=val", fmt.Sprintf("--chain-id=%s", c.meta.Id), "-b=block", "--yes", "--keyring-backend=test"}
+	for i := range c.validators {
+		if _, ok := c.skipRunValidatorIndexes[i]; ok {
 			continue
 		}
-
-		var (
-			outBuf bytes.Buffer
-			errBuf bytes.Buffer
-		)
-
-		s.Require().Eventually(
-			func() bool {
-				exec, err := s.dkrPool.Client.CreateExec(docker.CreateExecOptions{
-					Context:      ctx,
-					AttachStdout: true,
-					AttachStderr: true,
-					Container:    s.valResources[chain.ChainMeta.Id][i].Container.ID,
-					User:         "root",
-					Cmd: []string{
-						"osmosisd", "tx", "gov", "vote", "1", "yes", "--from=val", fmt.Sprintf("--chain-id=%s", chain.ChainMeta.Id), "-b=block", "--yes", "--keyring-backend=test",
-					},
-				})
-				s.Require().NoError(err)
-
-				err = s.dkrPool.Client.StartExec(exec.ID, docker.StartExecOptions{
-					Context:      ctx,
-					Detach:       false,
-					OutputStream: &outBuf,
-					ErrorStream:  &errBuf,
-				})
-				return strings.Contains(outBuf.String(), "code: 0")
-			},
-			time.Minute,
-			time.Second,
-			"tx returned a non-zero code; stdout: %s, stderr: %s", outBuf.String(), errBuf.String(),
-		)
-
-		s.T().Logf("successfully voted for proposal from %s container: %s", s.valResources[chain.ChainMeta.Id][i].Container.Name[1:], s.valResources[chain.ChainMeta.Id][i].Container.ID)
+		_, _, err := s.containerManager.ExecCmd(s.T(), c.meta.Id, i, cmd, "code: 0")
+		s.Require().NoError(err)
+		validatorResource, exists := s.containerManager.GetValidatorResource(c.meta.Id, i)
+		s.Require().True(exists)
+		s.T().Logf("successfully voted yes on proposal from %s container: %s", validatorResource.Container.Name[1:], validatorResource.Container.ID)
 	}
 }
 
-func (s *IntegrationTestSuite) chainStatus(containerId string) []byte {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-
-	exec, err := s.dkrPool.Client.CreateExec(docker.CreateExecOptions{
-		Context:      ctx,
-		AttachStdout: true,
-		AttachStderr: true,
-		Container:    containerId,
-		User:         "root",
-		Cmd: []string{
-			"osmosisd", "status",
-		},
-	})
+func (s *IntegrationTestSuite) voteNoProposal(c *chainConfig, validatorIndex int, from string) {
+	propStr := strconv.Itoa(c.latestProposalNumber)
+	s.T().Logf("voting no on proposal for chain-id: %s", c.meta.Id)
+	cmd := []string{"osmosisd", "tx", "gov", "vote", propStr, "no", fmt.Sprintf("--from=%s", from), fmt.Sprintf("--chain-id=%s", c.meta.Id), "-b=block", "--yes", "--keyring-backend=test"}
+	_, _, err := s.containerManager.ExecCmd(s.T(), c.meta.Id, validatorIndex, cmd, "code: 0")
 	s.Require().NoError(err)
-
-	var (
-		outBuf bytes.Buffer
-		errBuf bytes.Buffer
-	)
-
-	err = s.dkrPool.Client.StartExec(exec.ID, docker.StartExecOptions{
-		Context:      ctx,
-		Detach:       false,
-		OutputStream: &outBuf,
-		ErrorStream:  &errBuf,
-	})
-
-	s.Require().NoErrorf(
-		err,
-		"failed to query height; stdout: %s, stderr: %s", outBuf.String(), errBuf.String(),
-	)
-
-	errBufByte := errBuf.Bytes()
-	return errBufByte
-
+	validatorResource, exists := s.containerManager.GetValidatorResource(c.meta.Id, validatorIndex)
+	s.Require().True(exists)
+	s.T().Logf("successfully voted no for proposal from %s container: %s", validatorResource.Container.Name[1:], validatorResource.Container.ID)
 }
 
-func (s *IntegrationTestSuite) getCurrentChainHeight(containerId string) int {
-	var block syncInfo
-	out := s.chainStatus(containerId)
-	err := json.Unmarshal(out, &block)
+func (s *IntegrationTestSuite) chainStatus(c *chainConfig, i int) []byte {
+	cmd := []string{"osmosisd", "status"}
+	_, errBuf, err := s.containerManager.ExecCmd(s.T(), c.meta.Id, i, cmd, "")
 	s.Require().NoError(err)
+	return errBuf.Bytes()
+}
+
+func (s *IntegrationTestSuite) getCurrentChainHeight(c *chainConfig, i int) int {
+	var block syncInfo
+	s.Require().Eventually(
+		func() bool {
+			out := s.chainStatus(c, i)
+			err := json.Unmarshal(out, &block)
+			if err != nil {
+				return false
+			}
+			return true
+		},
+		1*time.Minute,
+		time.Second,
+		"Osmosis node failed to retrieve height info",
+	)
 	currentHeight, err := strconv.Atoi(block.SyncInfo.LatestHeight)
 	s.Require().NoError(err)
 	return currentHeight
 }
 
-func (s *IntegrationTestSuite) queryBalances(containerId string, addr string) (sdk.Coins, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-
-	exec, err := s.dkrPool.Client.CreateExec(docker.CreateExecOptions{
-		Context:      ctx,
-		AttachStdout: true,
-		AttachStderr: true,
-		Container:    containerId,
-		User:         "root",
-		Cmd: []string{
-			"osmosisd", "query", "bank", "balances", addr, "--output=json",
-		},
-	})
+func (s *IntegrationTestSuite) queryBalances(c *chainConfig, i int, addr string) (sdk.Coins, error) {
+	cmd := []string{"osmosisd", "query", "bank", "balances", addr, "--output=json"}
+	outBuf, _, err := s.containerManager.ExecCmd(s.T(), c.meta.Id, i, cmd, "")
 	s.Require().NoError(err)
 
-	var (
-		outBuf bytes.Buffer
-		errBuf bytes.Buffer
-	)
-
-	err = s.dkrPool.Client.StartExec(exec.ID, docker.StartExecOptions{
-		Context:      ctx,
-		Detach:       false,
-		OutputStream: &outBuf,
-		ErrorStream:  &errBuf,
-	})
-
-	s.Require().NoErrorf(
-		err,
-		"failed to query height; stdout: %s, stderr: %s", outBuf.String(), errBuf.String(),
-	)
-
-	outBufByte := outBuf.Bytes()
 	var balancesResp banktypes.QueryAllBalancesResponse
-	if err := util.Cdc.UnmarshalJSON(outBufByte, &balancesResp); err != nil {
-		return nil, err
-	}
+	err = util.Cdc.UnmarshalJSON(outBuf.Bytes(), &balancesResp)
+	s.Require().NoError(err)
 
 	return balancesResp.GetBalances(), nil
-
 }
 
-func (s *IntegrationTestSuite) createPool(c *chain.Chain, poolFile string) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	s.T().Logf("creating pool for chain-id: %s", c.ChainMeta.Id)
-	var (
-		outBuf bytes.Buffer
-		errBuf bytes.Buffer
+func (s *IntegrationTestSuite) queryPropTally(endpoint, addr string) (sdk.Int, sdk.Int, sdk.Int, sdk.Int, error) {
+	path := fmt.Sprintf(
+		"%s/cosmos/gov/v1beta1/proposals/%s/tally",
+		endpoint, addr,
 	)
+	bz, err := s.ExecQueryRPC(path)
+	s.Require().NoError(err)
 
-	s.Require().Eventually(
-		func() bool {
-			exec, err := s.dkrPool.Client.CreateExec(docker.CreateExecOptions{
-				Context:      ctx,
-				AttachStdout: true,
-				AttachStderr: true,
-				Container:    s.valResources[c.ChainMeta.Id][0].Container.ID,
-				User:         "root",
-				Cmd: []string{
-					"osmosisd", "tx", "gamm", "create-pool", fmt.Sprintf("--pool-file=/osmosis/%s", poolFile), fmt.Sprintf("--chain-id=%s", c.ChainMeta.Id), "--from=val", "-b=block", "--yes", "--keyring-backend=test",
-				},
-			})
-			s.Require().NoError(err)
-			err = s.dkrPool.Client.StartExec(exec.ID, docker.StartExecOptions{
-				Context:      ctx,
-				Detach:       false,
-				OutputStream: &outBuf,
-				ErrorStream:  &errBuf,
-			})
-			return strings.Contains(outBuf.String(), "code: 0")
-		},
-		time.Minute,
-		time.Second,
-		"tx returned non code 0; stdout: %s, stderr: %s", outBuf.String(), errBuf.String(),
+	var balancesResp govtypes.QueryTallyResultResponse
+	if err := util.Cdc.UnmarshalJSON(bz, &balancesResp); err != nil {
+		return sdk.ZeroInt(), sdk.ZeroInt(), sdk.ZeroInt(), sdk.ZeroInt(), err
+	}
+	noTotal := balancesResp.Tally.No
+	yesTotal := balancesResp.Tally.Yes
+	noWithVetoTotal := balancesResp.Tally.NoWithVeto
+	abstainTotal := balancesResp.Tally.Abstain
+
+	return noTotal, yesTotal, noWithVetoTotal, abstainTotal, nil
+}
+
+func (s *IntegrationTestSuite) createPool(c *chainConfig, poolFile string) {
+	s.T().Logf("creating pool for chain-id: %s", c.meta.Id)
+	cmd := []string{"osmosisd", "tx", "gamm", "create-pool", fmt.Sprintf("--pool-file=/osmosis/%s", poolFile), fmt.Sprintf("--chain-id=%s", c.meta.Id), "--from=val", "-b=block", "--yes", "--keyring-backend=test"}
+	_, _, err := s.containerManager.ExecCmd(s.T(), c.meta.Id, 0, cmd, "code: 0")
+	s.Require().NoError(err)
+	validatorResource, exists := s.containerManager.GetValidatorResource(c.meta.Id, 0)
+	s.Require().True(exists)
+	s.T().Logf("successfully created pool from %s container: %s", validatorResource.Container.Name[1:], validatorResource.Container.ID)
+}
+
+func (s *IntegrationTestSuite) lockTokens(c *chainConfig, validatorIndex int, tokens string, duration string, from string) {
+	s.T().Logf("locking %s for %s on chain-id: %s", tokens, duration, c.meta.Id)
+	cmd := []string{"osmosisd", "tx", "lockup", "lock-tokens", tokens, fmt.Sprintf("--chain-id=%s", c.meta.Id), fmt.Sprintf("--duration=%s", duration), fmt.Sprintf("--from=%s", from), "-b=block", "--yes", "--keyring-backend=test"}
+	_, _, err := s.containerManager.ExecCmd(s.T(), c.meta.Id, validatorIndex, cmd, "code: 0")
+	s.Require().NoError(err)
+	validatorResource, exists := s.containerManager.GetValidatorResource(c.meta.Id, validatorIndex)
+	s.Require().True(exists)
+	s.T().Logf("successfully created lock %v from %s container: %s", c.latestLockNumber, validatorResource.Container.Name[1:], validatorResource.Container.ID)
+	c.latestLockNumber = c.latestLockNumber + 1
+}
+
+func (s *IntegrationTestSuite) superfluidDelegate(c *chainConfig, valAddress string, from string) {
+	lockStr := strconv.Itoa(c.latestLockNumber)
+	s.T().Logf("superfluid delegating lock %s to %s on chain-id: %s", lockStr, valAddress, c.meta.Id)
+	cmd := []string{"osmosisd", "tx", "superfluid", "delegate", lockStr, valAddress, fmt.Sprintf("--chain-id=%s", c.meta.Id), fmt.Sprintf("--from=%s", from), "-b=block", "--yes", "--keyring-backend=test"}
+	_, _, err := s.containerManager.ExecCmd(s.T(), c.meta.Id, 0, cmd, "code: 0")
+	s.Require().NoError(err)
+	validatorResource, exists := s.containerManager.GetValidatorResource(c.meta.Id, 0)
+	s.Require().True(exists)
+	s.T().Logf("successfully superfluid delegated from %s container: %s", validatorResource.Container.Name[1:], validatorResource.Container.ID)
+}
+
+func (s *IntegrationTestSuite) sendTx(c *chainConfig, validatorIndex int, amount string, sendAddress string, receiveAddress string) {
+	s.T().Logf("sending %s from %s to %s on chain-id: %s", amount, sendAddress, receiveAddress, c.meta.Id)
+	cmd := []string{"osmosisd", "tx", "bank", "send", sendAddress, receiveAddress, amount, fmt.Sprintf("--chain-id=%s", c.meta.Id), "--from=val", "-b=block", "--yes", "--keyring-backend=test"}
+	_, _, err := s.containerManager.ExecCmd(s.T(), c.meta.Id, validatorIndex, cmd, "code: 0")
+	s.Require().NoError(err)
+	validatorResource, exists := s.containerManager.GetValidatorResource(c.meta.Id, validatorIndex)
+	s.Require().True(exists)
+	s.T().Logf("successfully sent tx from %s container: %s", validatorResource.Container.Name[1:], validatorResource.Container.ID)
+}
+
+func (s *IntegrationTestSuite) extractValidatorOperatorAddresses(config *chainConfig) {
+	for i, val := range config.validators {
+		if _, ok := config.skipRunValidatorIndexes[i]; ok {
+			s.T().Logf("skipping %s validator with index %d from running...", val.validator.Name, i)
+			continue
+		}
+		cmd := []string{"osmosisd", "debug", "addr", val.validator.PublicKey}
+		s.T().Logf("extracting validator operator addresses for chain-id: %s", config.meta.Id)
+		_, errBuf, err := s.containerManager.ExecCmd(s.T(), config.meta.Id, i, cmd, "")
+		s.Require().NoError(err)
+		re := regexp.MustCompile("osmovaloper(.{39})")
+		operAddr := fmt.Sprintf("%s\n", re.FindString(errBuf.String()))
+		config.validators[i].operatorAddress = strings.TrimSuffix(operAddr, "\n")
+	}
+}
+
+func (s *IntegrationTestSuite) queryIntermediaryAccount(c *chainConfig, endpoint string, denom string, valAddr string) (int, error) {
+	intAccount := superfluidtypes.GetSuperfluidIntermediaryAccountAddr(denom, valAddr)
+	path := fmt.Sprintf(
+		"%s/cosmos/staking/v1beta1/validators/%s/delegations/%s",
+		endpoint, valAddr, intAccount,
 	)
+	bz, err := s.ExecQueryRPC(path)
+	s.Require().NoError(err)
 
-	s.T().Logf("successfully created pool from %s container: %s", s.valResources[c.ChainMeta.Id][0].Container.Name[1:], s.valResources[c.ChainMeta.Id][0].Container.ID)
+	var stakingResp stakingtypes.QueryDelegationResponse
+	err = util.Cdc.UnmarshalJSON(bz, &stakingResp)
+	s.Require().NoError(err)
 
+	intAccBalance := stakingResp.DelegationResponse.Balance.Amount.String()
+	intAccountBalance, err := strconv.Atoi(intAccBalance)
+	s.Require().NoError(err)
+	return intAccountBalance, err
+}
+
+func (s *IntegrationTestSuite) createWallet(c *chainConfig, index int, walletName string) string {
+	cmd := []string{"osmosisd", "keys", "add", walletName, "--keyring-backend=test"}
+	outBuf, _, err := s.containerManager.ExecCmd(s.T(), c.meta.Id, index, cmd, "")
+	s.Require().NoError(err)
+	re := regexp.MustCompile("osmo1(.{38})")
+	walletAddr := fmt.Sprintf("%s\n", re.FindString(outBuf.String()))
+	walletAddr = strings.TrimSuffix(walletAddr, "\n")
+	return walletAddr
 }

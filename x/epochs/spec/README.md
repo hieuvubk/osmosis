@@ -11,17 +11,128 @@ they can easily be signalled upon such events.
 
 ## Contents
 
-1. **[Concept](01_concepts.md)**
-2. **[State](02_state.md)**
-3. **[Events](03_events.md)**
-4. **[Keeper](04_keeper.md)**\
-5. **[Hooks](05_hooks.md)**\
-6. **[Queries](06_queries.md)**\
-7. **[Future improvements](07_future_improvements.md)**
+1. **[Concept](#concepts)**
+2. **[State](#state)**
+3. **[Events](#events)**
+4. **[Keeper](#keeper)**
+5. **[Hooks](#hooks)**
+6. **[Queries](#queries)**
+7. **[Downtime Recovery](#downtime-recovery)**
+
+## Concepts
+
+The epochs module defines on-chain timers, that execute at fixed time intervals.
+Other SDK modules can then register logic to be executed at the timer ticks.
+We refer to the period in between two timer ticks as an "epoch".
+
+Every timer has a unique identifier.
+Every epoch will have a start time, and an end time, where `end time = start time + timer interval`.
+On Osmosis mainnet, we only utilize one identifier, with a time interval of `one day`.
+
+The timer will tick at the first block whose blocktime is greater than the timer end time,
+and set the start as the prior timer end time. (Notably, its not set to the block time!)
+This means that if the chain has been down for awhile, you will get one timer tick per block,
+until the timer has caught up.
+
+## State
+
+The Epochs module keeps a single [`EpochInfo`](https://github.com/osmosis-labs/osmosis/blob/b4befe4f3eb97ebb477323234b910c4afafab9b7/proto/osmosis/epochs/genesis.proto#L12) per identifier.
+This contains the current state of the timer with the corresponding identifier.
+Its fields are modified at every timer tick. 
+EpochInfos are initialized as part of genesis initialization or upgrade logic,
+and are only modified on begin blockers.
+
+## Events
+
+The `epochs` module emits the following events:
+
+### BeginBlocker
+
+|  Type          | Attribute Key |  Attribute Value |
+|  --------------| ---------------| -----------------|
+|  epoch\_start |  epoch\_number |  {epoch\_number} |
+|  epoch\_start |  start\_time   |  {start\_time} |
+
+### EndBlocker
+
+|  Type        | Attribute Key  | Attribute Value |
+|  ------------| ---------------| -----------------|
+|  epoch\_end  | epoch\_number  | {epoch\_number} |
+
+## Keepers
+
+### Keeper functions
+
+Epochs keeper module provides utility functions to manage epochs.
+
+```go
+// Keeper is the interface for lockup module keeper
+type Keeper interface {
+  // GetEpochInfo returns epoch info by identifier
+  GetEpochInfo(ctx sdk.Context, identifier string) types.EpochInfo
+  // SetEpochInfo set epoch info
+  SetEpochInfo(ctx sdk.Context, epoch types.EpochInfo) 
+  // DeleteEpochInfo delete epoch info
+  DeleteEpochInfo(ctx sdk.Context, identifier string)
+  // IterateEpochInfo iterate through epochs
+  IterateEpochInfo(ctx sdk.Context, fn func(index int64, epochInfo types.EpochInfo) (stop bool))
+  // Get all epoch infos
+  AllEpochInfos(ctx sdk.Context) []types.EpochInfo
+}
+```
+
+## Hooks
+
+```go
+  // the first block whose timestamp is after the duration is counted as the end of the epoch
+  AfterEpochEnd(ctx sdk.Context, epochIdentifier string, epochNumber int64)
+  // new epoch is next block of epoch end block
+  BeforeEpochStart(ctx sdk.Context, epochIdentifier string, epochNumber int64)
+```
+
+### How modules receive hooks
+
+On hook receiver function of other modules, they need to filter
+`epochIdentifier` and only do executions for only specific
+epochIdentifier. Filtering epochIdentifier could be in `Params` of other
+modules so that they can be modified by governance.
+
+This is the standard dev UX of this:
+```golang
+func (k MyModuleKeeper) AfterEpochEnd(ctx sdk.Context, epochIdentifier string, epochNumber int64) {
+    params := k.GetParams(ctx)
+    if epochIdentifier == params.DistrEpochIdentifier {
+    // my logic
+  }
+}
+```
+
+### Panic isolation
+
+If a given epoch hook panics, its state update is reverted, but we keep
+proceeding through the remaining hooks. This allows more advanced epoch
+logic to be used, without concern over state machine halting, or halting
+subsequent modules.
+
+This does mean that if there is behavior you expect from a prior epoch
+hook, and that epoch hook reverted, your hook may also have an issue. So
+do keep in mind "what if a prior hook didn't get executed" in the safety
+checks you consider for a new epoch hook.
 
 ## Queries
 
-### epoch-infos
+Epochs module is providing below queries to check the module's state.
+
+```protobuf
+service Query {
+  // EpochInfos provide running epochInfos
+  rpc EpochInfos(QueryEpochsInfoRequest) returns (QueryEpochsInfoResponse) {}
+  // CurrentEpoch provide current epoch of specified identifier
+  rpc CurrentEpoch(QueryCurrentEpochRequest) returns (QueryCurrentEpochResponse) {}
+}
+```
+
+### Epoch Infos
 
 Query the currently running epochInfos
 
@@ -51,7 +162,8 @@ epochs:
 ```
 :::
 
-### current-epoch
+### Current Epoch
+
 
 Query the current epoch by the specified identifier
 
@@ -72,4 +184,3 @@ Which in this example outputs:
 ```sh
 current_epoch: "183"
 ```
-:::
