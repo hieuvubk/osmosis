@@ -208,9 +208,9 @@ sync-docs:
 ###                           Tests & Simulation                            ###
 ###############################################################################
 
-PACKAGES_UNIT=$(shell go list ./... | grep -E -v 'simapp|e2e')
+PACKAGES_UNIT=$(shell go list ./... | grep -E -v 'tests/simulator|e2e')
 PACKAGES_E2E=$(shell go list ./... | grep '/e2e')
-PACKAGES_SIM=$(shell go list ./... | grep '/simapp')
+PACKAGES_SIM=$(shell go list ./... | grep '/tests/simulator')
 TEST_PACKAGES=./...
 
 include sims.mk
@@ -249,6 +249,9 @@ docker-build-debug:
 
 docker-build-e2e-init-chain:
 	@docker build -t osmosis-e2e-init-chain:debug --build-arg E2E_SCRIPT_NAME=chain -f tests/e2e/initialization/init.Dockerfile .
+
+docker-build-e2e-init-node:
+	@docker build -t osmosis-e2e-init-node:debug --build-arg E2E_SCRIPT_NAME=node -f tests/e2e/initialization/init.Dockerfile .
 
 ###############################################################################
 ###                                Linting                                  ###
